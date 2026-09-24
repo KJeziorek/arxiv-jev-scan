@@ -1,0 +1,256 @@
+# arxiv-jev-scan
+
+Keep up with arXiv on one specific topic without reading hundreds of abstracts a day.
+
+You describe the topic in a small YAML file, for example "papers about event cameras, and not about
+events in the everyday sense". The scanner harvests new papers from the arXiv categories you choose
+and asks [Jev](https://docs.typesafe.ai), TypeSafe's classification model, whether each paper
+matches. Papers that match are sorted into sub-topics. You browse the results in a small web
+dashboard, download the PDFs you care about, and get a desktop notification when something new
+shows up.
+
+It is built for one person on one machine: SQLite for storage, Markdown notes for syncing to your
+other devices, and no servers or accounts beyond a Jev API key.
+
+## What it does
+
+- Scans any arXiv categories (cs.CV, cs.RO, eess.IV, ...), from a one-off backfill of a whole
+  year down to a quick daily update.
+- Never sends the same paper to Jev twice, no matter how often you re-run a scan.
+- Classifies in stages defined in YAML. The first stage is a yes/no relevance question with an
+  accept / maybe / reject band, so borderline papers are kept for you to review instead of being
+  dropped. Later stages only run for papers that passed, so a rejected paper costs a single call.
+- Resumes an interrupted backfill from the last finished day.
+- Shows every paper's per-stage answers, token usage and cost in the dashboard.
+- Downloads PDFs one at a time or all at once, with polite rate limiting.
+- Draws a network graph of related papers.
+- Exports accepted papers as Markdown notes with YAML frontmatter, ready for Obsidian.
+
+## Requirements
+
+- Python 3.10 or newer
+- A TypeSafe API key from https://console.typesafe.ai/keys
+
+## Installation
+
+```bash
+git clone https://github.com/<you>/arxiv-jev-scan.git
+cd arxiv-jev-scan
+
+python -m venv .venv
+source .venv/bin/activate          # on Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+
+cp .env.example .env               # then put your API key in .env
+```
+
+## Describe your topic
+
+Everything about a topic lives in `config/stages.yaml`. The file that ships with the project looks
+for event camera papers:
+
+```yaml
+topic: Event cameras
+data_dir: data
+
+source:
+  categories: [cs.CV, cs.RO]
+
+stages:
+  - name: relevance
+    type: noul                 # a yes/no question
+    instructions: >-
+      Is this paper about event cameras, meaning neuromorphic vision sensors
+      that report per-pixel brightness changes, or about processing the event
+      streams they produce?
+    criteria:
+      true: The paper uses, studies, simulates or builds event cameras ...
+      false: The paper does not involve event cameras. Event detection in ordinary video ...
+    accept_threshold: 0.8      # probability >= 0.8 is accepted
+    reject_threshold: 0.2      # probability <= 0.2 is rejected, anything in between is "maybe"
+
+  - name: domain
+    type: choice               # pick one option; likely options become tags
+    instructions: What is the main application area of this event camera paper?
+    criteria:
+      Robotics: Robots, drones, autonomous driving, navigation or control
+      Perception: Object detection, tracking, recognition or segmentation
+      Imaging: Video or image reconstruction, deblurring, HDR ...
+      Other: None of the areas above
+```
+
+Jev reads questions quite literally, so spell out what counts as yes and what counts as no. The
+comments in the file explain each field.
+
+Each paper is stored once and never classified again, so one config file means one topic. To follow
+a second topic, copy the file, change `topic`, `data_dir` and the stages, and pass it with
+`--config`. The dashboard lets you switch between config files.
+
+## Usage
+
+### A first try
+
+Scan a few days, but stop after 20 new papers:
+
+```bash
+python -m scanner.cli scan --since 2026-09-20 --max 20
+```
+
+The output looks like this:
+
+```
+10:02:11 INFO    Scanning cs.CV, cs.RO for 'Event cameras' since 2026-09-20
+10:02:21 INFO    arXiv 2026-09-20: 212 records in cs.CV, cs.RO
+10:02:25 INFO    Reached the limit of 20 new papers, stopping
+10:02:25 INFO    Done: 20 new papers, 1 accepted, 0 maybe, 19 rejected, 0 failed, cost $0.0003
+10:02:25 INFO      accepted: Multi-viewpoint Geo-localization with Event Cameras
+```
+
+### A big backfill
+
+```bash
+python -m scanner.cli scan --since 2026-01-01
+```
+
+The scanner works through the date range one day at a time and saves a checkpoint after each day.
+If you stop it with Ctrl+C, or your laptop goes to sleep, run the same command again and it picks
+up where it stopped. Harvesting is limited by arXiv's rules (one request every three seconds), so a
+year of cs.CV takes a while. Leave it running in a terminal.
+
+### Daily updates
+
+```bash
+python -m scanner.cli scan
+```
+
+Without `--since`, the scan starts at the last day a previous scan finished. Papers already in the
+database are skipped before any Jev call, so overlapping runs cost nothing.
+
+### The dashboard
+
+```bash
+streamlit run app.py
+```
+
+This opens http://localhost:8501 in your browser. From there you can:
+
+- start a scan from the sidebar, either "since the last scan" or for a date range
+- see totals for papers, tokens and cost
+- browse the Relevant, Maybe and Rejected tabs, and click a row to see the abstract, each stage's
+  decision, the relevance probability and the sub-topic probabilities
+- download a single PDF, or all of them with "Download all PDFs"
+- open the Graph tab, where you choose how papers are connected: through shared tag hubs, directly
+  to their most similar papers, or through tag hubs plus shared authors
+
+### PDFs and notes
+
+```bash
+python -m scanner.cli download-all                    # PDFs of accepted papers
+python -m scanner.cli download-all --status accepted,maybe
+python -m scanner.cli export                          # Obsidian notes, also done after every scan
+python -m scanner.cli stats                           # totals and recent scans
+```
+
+`download-all` skips papers whose PDF is already downloaded, so running it again only fetches what
+is missing.
+
+## Where your data goes
+
+```
+data/
+  papers.db        SQLite database: papers, every Jev answer, scan runs
+  pdfs/            downloaded PDFs, named after the arXiv id
+  obsidian/        one Markdown note per accepted paper
+```
+
+`data/` is in `.gitignore`. To read your papers on another device, open `data/obsidian` as an
+Obsidian vault, or sync it with git, Dropbox or Obsidian Sync.
+
+## Running on a schedule
+
+arXiv announces new papers on weekday evenings (US Eastern time), so a morning run picks up each
+new batch.
+
+Linux and macOS, with `crontab -e`:
+
+```
+0 8 * * * cd /path/to/arxiv-jev-scan && DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus .venv/bin/python -m scanner.cli scan >> data/scan.log 2>&1
+```
+
+The `DBUS_SESSION_BUS_ADDRESS` part is Linux-only. Cron jobs don't see your desktop session, and
+without it the notification can't be shown. The scan runs either way. On macOS, notifications
+through `plyer` need `pyobjus`; without it you only get the log.
+
+Windows, in a terminal:
+
+```
+schtasks /Create /SC DAILY /ST 08:00 /TN arxiv-jev-scan ^
+  /TR "cmd /c cd /d C:\path\to\arxiv-jev-scan && .venv\Scripts\python -m scanner.cli scan >> data\scan.log 2>&1"
+```
+
+## Costs
+
+Jev charges for input tokens only. At the time of writing it costs $0.042 per million tokens for
+`jev-1.13`, and output tokens are free. A title plus abstract plus the question comes to roughly
+300 to 400 tokens, so classifying a thousand papers costs about one or two cents. The cost shown in
+the dashboard uses the price set in `.env` (`JEV_PRICE_PER_MILLION_INPUT_TOKENS`). Change it there
+if your price is different.
+
+## How it works
+
+1. **Harvest.** Papers come from arXiv's [OAI-PMH](https://info.arxiv.org/help/oa/index.html)
+   interface, one category set and one day at a time. This is arXiv's official bulk metadata
+   service. The search API (`export.arxiv.org/api/query`) has been rejecting most automated
+   date-range queries with HTTP 406, so it isn't used. Revisions of old papers also show up in the
+   harvest and are skipped.
+2. **Dedup.** Every paper id is inserted into SQLite first. Only ids the database has never seen
+   continue.
+3. **Classify.** Each new paper goes through the stages in order, one Jev call per stage, with ten
+   papers in parallel. The first `reject` stops the paper. The answers, tokens and cost of every
+   call are stored.
+4. **Checkpoint.** After each finished day the scan records that day, so an interrupted run
+   continues from there.
+5. **Export and notify.** Accepted papers are written as Markdown notes, and if any are new you get
+   a desktop notification.
+
+The design decisions and their trade-offs are written up in
+[docs/architecture.md](docs/architecture.md).
+
+## Project layout
+
+```
+config/stages.yaml        topic, categories and pipeline stages
+scanner/
+  sources/base.py         PaperSource interface
+  sources/arxiv.py        arXiv OAI-PMH harvester
+  jev_client.py           Jev calls through the official typesafe-sdk, cost accounting
+  pipeline.py             dedup, stages, thresholds, checkpoints
+  db.py                   SQLite schema and queries
+  pdfs.py                 single and bulk PDF downloads
+  exporters/obsidian.py   Markdown export
+  notify.py               desktop notification
+  cli.py                  command line interface
+app.py                    Streamlit dashboard
+graph_view.py             NetworkX + Pyvis graph
+tests/                    pytest suite, no network or API key needed
+```
+
+## Tests
+
+```bash
+python -m pytest
+```
+
+The tests use canned arXiv responses and a mocked Jev API, so they run offline in about a second.
+
+## Adding another source
+
+Write a class that extends `PaperSource` in `scanner/sources/` and implements
+`fetch_day(categories, day)`, returning a list of `Paper` objects. The pipeline, database and
+dashboard don't need to change.
+
+## Ideas for later
+
+- A second pass that reads the full PDF text to find richer connections between papers than
+  shared tags.
+- More sources, such as OpenReview and bioRxiv.

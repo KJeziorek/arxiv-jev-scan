@@ -1,0 +1,60 @@
+# A scan profile: what you are looking for and how Jev should judge papers.
+#
+# One profile = one topic = one data folder. Papers that are already in the
+# database are never sent to Jev again, so if you want to track a different
+# topic, copy this file, change `topic`, `data_dir` and the stages, and run
+# the scanner with `--config config/your-file.yaml`.
+
+# Short name of the topic, shown in the dashboard and in notifications.
+topic: Event cameras
+
+# Database, PDFs and Obsidian notes for this profile are stored here.
+data_dir: data
+
+source:
+  # arXiv categories to harvest. Cross-listed papers are included.
+  categories: [cs.CV, cs.RO]
+
+# Stages run in order, one Jev call per stage per paper.
+#
+#   noul    a yes/no question. `accept_threshold` and `reject_threshold` split
+#           the answer (a probability) into accept / maybe / reject. A rejected
+#           paper stops here, so later stages cost nothing for it.
+#   choice  pick one option from `criteria`. Options with probability of at
+#           least `tag_threshold` become tags of the paper. A choice stage never
+#           rejects; answers below `min_confidence` are only flagged as "maybe".
+#
+# Jev reads questions literally, so say exactly what counts as yes and no.
+stages:
+  - name: relevance
+    type: noul
+    instructions: >-
+      Is this paper about event cameras, meaning neuromorphic vision sensors
+      that report per-pixel brightness changes, or about processing the event
+      streams they produce?
+    criteria:
+      true: >-
+        The paper uses, studies, simulates or builds event cameras (also called
+        dynamic vision sensors, DVS, DAVIS, silicon retinas or neuromorphic
+        cameras), or works with event-camera data.
+      false: >-
+        The paper does not involve event cameras. Event detection in ordinary
+        video, social or news events, event logs, event-driven software and
+        other uses of the word "event" count as no.
+    accept_threshold: 0.8
+    reject_threshold: 0.2
+
+  - name: domain
+    type: choice
+    instructions: What is the main application area of this event camera paper?
+    criteria:
+      Robotics: Robots, drones, autonomous driving, navigation or control
+      Perception: Object detection, tracking, recognition or segmentation
+      Motion and 3D: Optical flow, depth, SLAM, visual odometry, pose or 3D reconstruction
+      Imaging: Video or image reconstruction, deblurring, HDR, super-resolution or frame interpolation
+      Multimodal: Fusion of events with RGB frames, LiDAR, IMU, audio or language
+      Hardware and neuromorphic computing: Sensor or circuit design, spiking neural networks, neuromorphic chips
+      Datasets and benchmarks: The main contribution is a dataset, benchmark or simulator
+      Other: None of the areas above
+    tag_threshold: 0.25
+    min_confidence: 0.5

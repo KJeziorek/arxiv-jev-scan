@@ -1,0 +1,8 @@
+# local data: database, PDFs, Obsidian notes
+data/
+
+.env
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/

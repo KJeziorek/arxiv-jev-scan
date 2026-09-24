@@ -1,0 +1,13 @@
+typesafe-sdk>=0.7        # official Jev client (retries, typed answers)
+requests>=2.31           # arXiv OAI-PMH and PDF downloads
+PyYAML>=6.0
+python-dotenv>=1.0
+
+streamlit>=1.46          # dashboard
+pandas>=2.0
+networkx>=3.0            # paper graph
+pyvis>=0.3.2             # interactive graph rendering
+
+plyer>=2.1               # desktop notifications
+
+pytest>=8.0
