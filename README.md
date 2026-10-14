@@ -25,6 +25,9 @@ other devices, and no servers or accounts beyond a Jev API key.
 - Downloads PDFs one at a time or all at once, with polite rate limiting.
 - Draws a network graph of related papers.
 - Exports accepted papers as Markdown notes with YAML frontmatter, ready for Obsidian.
+- Builds a training dataset from Jev's answers and your own labels, and runs scans on a free local
+  decision model instead of Jev once you have trained one (see "Labelling papers and building a
+  training dataset" below).
 
 ## Requirements
 
@@ -148,11 +151,166 @@ This opens http://localhost:8501 in your browser. From there you can:
 python -m scanner.cli download-all                    # PDFs of accepted papers
 python -m scanner.cli download-all --status accepted,maybe
 python -m scanner.cli export                          # Obsidian notes, also done after every scan
-python -m scanner.cli stats                           # totals and recent scans
+python -m scanner.cli stats                           # totals, label counts and recent scans
+python -m scanner.cli labels export                   # back up your labels
 ```
 
 `download-all` skips papers whose PDF is already downloaded, so running it again only fetches what
 is missing.
+
+### Labelling papers and building a training dataset
+
+This fork aims to replace Jev with a free local decision model (Laya, or a Qwen model fine-tuned
+with [Unsloth](https://unsloth.ai/docs/basics/train-your-own-decision-model-with-unsloth), for
+example on a free Colab GPU). The first step is a dataset: Jev's answers serve as the teacher, and
+your own labels fix the cases it was unsure about or got wrong.
+
+In the dashboard, the **Label** tab has two queues:
+
+- **Maybe papers.** Papers Jev was unsure about, most likely relevant first. Answer Relevant or
+  Not relevant. These become training data. Maybe papers you don't label are left out of the
+  dataset, since nobody knows their answer.
+- **Test sample.** Random papers, balanced between those Jev accepted, rejected and was unsure
+  about, with Jev's answer hidden. They are held out and never trained on, so they show how a
+  local model compares with Jev. A few hundred is a good size.
+
+You can also label any paper from its details in the Relevant, Maybe and Rejected tabs, for
+example when you spot a mistake. The "You" column shows your labels.
+
+Then export the dataset:
+
+```bash
+python -m scanner.cli export-dataset --test-size 300    # writes data/dataset/
+```
+
+`--test-size 300` holds out random papers, half relevant and half not, with Jev's answers as
+gold, until the test set has 300 papers. Papers you labelled from the test sample count towards
+the 300. At most half of the relevant papers are held out, so training keeps enough of them. The
+held-out papers are remembered in the database, so later exports keep them in the test set even
+without the option and after new scans; a paper that was tested on never moves into training.
+
+A test set with Jev's answers measures how closely a model copies Jev, and Jev itself scores 100%
+on it. That is enough to decide whether a local model can replace Jev. To also measure how often
+Jev and the model are actually right, label papers from the test sample yourself; each test row's
+`label_source` says where its answer came from.
+
+```
+data/dataset/
+  train.jsonl      every paper with a known answer, except the test set
+  test.jsonl       held-out papers and the papers you labelled from the test sample
+  manifest.json    row counts, relevant vs not, where the labels came from
+  labels.jsonl     a backup of your labels (see below)
+  README.md        dataset card for the Hugging Face Hub
+```
+
+Each line uses the row format of Unsloth's decision-model trainer: `state` (title and abstract),
+`questions` (the stages from your config) and `gold` (the answers), each as a JSON string. The
+relevance answer is your label when you gave one, otherwise Jev's accept or reject. Later stages
+are only asked for papers that are relevant, with Jev's answers as gold; choice stages keep Jev's
+probabilities as soft labels. Each line also carries `jev` with Jev's raw answers, for comparing
+models later, plus `id`, `split`, `label_source` (`human` or `jev`) and `published`.
+
+Relevant papers are rare, so scan enough days to have at least a hundred or so of them before
+training. Before publishing a model trained on Jev's answers, check TypeSafe's terms of service.
+
+#### Sharing the dataset through the Hugging Face Hub
+
+Keep the dataset out of git: every export rewrites the files, so each one would stay in the
+history forever, and two branches with different exports can't be merged. A Hugging Face dataset
+repository versions every upload and loads straight into Colab. Log in once
+(`hf auth login`, with a token that can write), put the repository name in `.env`:
+
+```
+HF_DATASET_REPO=your-name/arxiv-event-cameras
+HF_MODEL_REPO=your-name/arxiv-event-cameras-model
+```
+
+then export and upload in one go:
+
+```bash
+python -m scanner.cli export-dataset --test-size 300 --push
+```
+
+`--push your-name/other-repo` uploads somewhere else instead. The repository is created as private
+unless you add `--public`.
+
+#### Training a local model in Colab
+
+[`notebooks/train_decision_model.ipynb`](notebooks/train_decision_model.ipynb) runs on a free Colab
+T4 GPU. Open it in Colab (File > Open notebook > GitHub, or upload it), choose a T4 runtime, and drag
+your `.env` into the Files pane, or add `HF_DATASET_REPO`, `HF_MODEL_REPO` and `HF_TOKEN` as Colab
+secrets. It:
+
+1. loads the dataset from `HF_DATASET_REPO` and builds a balanced training set: every relevant
+   paper plus ten rejected ones each, half of them the rejected papers Jev found most borderline
+2. scores zero-shot Laya on the test set
+3. fine-tunes Laya and Qwen3.5-0.8B with [Unsloth](https://unsloth.ai/docs/basics/train-your-own-decision-model-with-unsloth)
+   and scores them: the share of relevant papers found, the precision of accepted papers, the share
+   left at "maybe", and sub-topic accuracy
+4. suggests accept and reject thresholds and uploads the best model as GGUF to `HF_MODEL_REPO`
+
+Results of the first run, for the event camera topic: [docs/training-results.md](docs/training-results.md).
+
+#### Scanning with the local model
+
+The trained model runs in [llama.cpp](https://github.com/ggml-org/llama.cpp)'s server, which
+answers the same requests as Jev at `/v1/systemone`. You need llama.cpp release **b11443 or newer**,
+the first with decision models (`brew install llama.cpp`, `winget install llama.cpp`, or a
+[release build](https://github.com/ggml-org/llama.cpp/releases)). Start it in its own terminal:
+
+```bash
+hf download your-name/arxiv-event-cameras-model qwen-q8_0.gguf --local-dir models/event-cameras
+llama-server -m models/event-cameras/qwen-q8_0.gguf --port 8080 -c 4096 -b 4096 -ub 4096
+```
+
+- The notebook uploads the model as `<model>-q8_0.gguf`, for example `qwen-q8_0.gguf`. `models/` is
+  in `.gitignore`.
+- `-ub 4096`: a decision model reads the whole prompt in one batch, and the default of 512 tokens is
+  too small for a title, an abstract and the question.
+- On a CPU, a paper takes about a second. With an NVIDIA GPU, use a CUDA build of llama.cpp, add
+  `-ngl 99 -np 8 -c 32768` to the server and `--workers 8` to `scan` and `evaluate`.
+
+Then point the scanner at it in `.env`:
+
+```
+DECISION_BACKEND=local
+LOCAL_DECISION_URL=http://127.0.0.1:8080
+```
+
+Scans, the dashboard and `evaluate` now use the local model, and its cost is recorded as $0. The
+`model` column of each stored answer says which model gave it. `scan --backend jev` or
+`--backend local` overrides `.env` for one run. If the server is not running, the scan stops at once
+with the command to start it.
+
+Before switching, score the model on the test set the way a scan asks its questions:
+
+```bash
+python -m scanner.cli evaluate --backend local
+python -m scanner.cli evaluate --backend local --accept 0.6 --reject 0.5   # try other thresholds
+python -m scanner.cli evaluate --backend jev    # Jev on the same papers, about 300 calls
+```
+
+It prints the share of relevant papers found, the precision of accepted papers, the share left at
+"maybe" and sub-topic accuracy, separately for answers from Jev and from your own labels. A second
+table shows the same numbers at other accept and reject thresholds, computed from the same answers,
+so you can choose thresholds without asking the model again. Last, it lists the relevant papers the
+model missed and the irrelevant ones it accepted.
+
+#### Backing up your labels
+
+Your labels are the only part of this that costs your time, and they live in `papers.db`. Save
+them to a small file, and load them back on another machine or into a fresh database:
+
+```bash
+python -m scanner.cli labels export                 # writes data/labels.jsonl
+python -m scanner.cli labels import                 # reads data/labels.jsonl
+python -m scanner.cli labels import path/to/labels.jsonl   # or any other backup
+```
+
+`export-dataset` also writes `labels.jsonl` into the dataset folder, so `--push` backs them up.
+Importing keeps the newer label when both sides labelled a paper. Labels for papers you have not
+scanned yet are kept and apply once a scan reaches them, so on a new machine you can import first
+and scan afterwards.
 
 ## Where your data goes
 
@@ -161,6 +319,7 @@ data/
   papers.db        SQLite database: papers, every Jev answer, scan runs
   pdfs/            downloaded PDFs, named after the arXiv id
   obsidian/        one Markdown note per accepted paper
+  dataset/         training dataset from `export-dataset`
 ```
 
 `data/` is in `.gitignore`. To read your papers on another device, open `data/obsidian` as an
@@ -219,19 +378,24 @@ The design decisions and their trade-offs are written up in
 ## Project layout
 
 ```
-config/stages.yaml        topic, categories and pipeline stages
+config/stages.yaml        topic, categories and pipeline stages (event cameras)
+config/uav-fpga-fusion.yaml  a second example profile with several sub-topic stages
 scanner/
   sources/base.py         PaperSource interface
   sources/arxiv.py        arXiv OAI-PMH harvester
-  jev_client.py           Jev calls through the official typesafe-sdk, cost accounting
+  jev_client.py           Jev or a local llama.cpp model through the official typesafe-sdk, cost accounting
   pipeline.py             dedup, stages, thresholds, checkpoints
   db.py                   SQLite schema and queries
   pdfs.py                 single and bulk PDF downloads
   exporters/obsidian.py   Markdown export
+  exporters/dataset.py    training dataset export (train.jsonl, test.jsonl), Hugging Face upload
+  evaluate.py             scores a backend on the test set the way a scan asks
   notify.py               desktop notification
   cli.py                  command line interface
 app.py                    Streamlit dashboard
 graph_view.py             NetworkX + Pyvis graph
+notebooks/train_decision_model.ipynb   Colab notebook: fine-tune Laya and Qwen, export GGUF
+docs/training-results.md  results of the training runs so far
 tests/                    pytest suite, no network or API key needed
 ```
 

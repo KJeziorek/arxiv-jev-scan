@@ -93,6 +93,59 @@ shows it read-only and lets you pick a config file, and each config has its own 
 - Desktop notifications go through `plyer` and are best effort, so a missing backend never fails a
   scan.
 
+### 7. Labels and a training dataset for a local model
+
+Jev is a paid API. To replace it with a free local decision model, the database also keeps your
+own relevance labels in a `labels` table (schema version 2; older databases gain the table when
+opened).
+
+- Jev's accept and reject decisions are the default gold answers, so a scan builds a dataset at
+  no extra effort. Your label overrides Jev's, which is how "maybe" papers and Jev's mistakes get
+  an answer.
+- Each label has a split. Papers labelled from the dashboard's test sample are `test` and are
+  never written to `train.jsonl`. The sample is balanced across Jev's accepted, maybe and rejected
+  papers, because a plain random sample would hold almost no relevant papers and could not
+  measure how many a model misses. Jev's answer is hidden while labelling it.
+- `export-dataset --test-size N` can fill the test set without labelling, by holding out random
+  papers with Jev's answers, half relevant (at most half of all relevant papers). It then
+  measures agreement with Jev rather than correctness, which is enough to decide whether a local
+  model can replace Jev. The held-out ids go into a `test_holdout` table (schema version 3)
+  instead of being re-drawn on each export: a re-draw over a growing set of papers would move
+  some tested papers into training.
+- Labels answer the relevance question only. Later stages take Jev's answers as gold and are
+  only asked for relevant papers, because their questions assume an on-topic paper.
+- The export uses the row format of Unsloth's decision-model trainer (`state`, `questions`,
+  `gold` as JSON strings), and the state is built by the same function the scan uses, so a model
+  trained on it sees exactly what Jev saw.
+
+### 8. A local decision model as a second backend
+
+The labels and the export (section 7) exist to train a free replacement for Jev. The rest of the
+tool does not change for it:
+
+- **Same API.** llama.cpp's server answers TypeSafe's System One requests at `/v1/systemone`, so
+  `JevClient` talks to it through the same `typesafe-sdk`, only with another base URL and a
+  placeholder key. `DECISION_BACKEND=local` (or `--backend local`) selects it; its cost is
+  recorded as $0 and the `model` column says which model answered. A scan checks `/health` first,
+  so a stopped server fails once with the start command instead of failing every paper.
+- **CPU-friendly defaults.** A laptop CPU needs about a second per answer, more while requests
+  share it, so the local backend waits up to `LOCAL_DECISION_TIMEOUT` (120 s) and sends 2
+  parallel requests instead of 10.
+- **One question per request, in training as in scanning.** Clef heads (Unsloth's decision head
+  on Qwen) read all questions of a request together. In the dataset, only relevant papers have
+  sub-topic questions, so a model trained or tested with all of a row's questions at once can
+  tell relevance from the number of questions. The first trained model did exactly that: perfect
+  in its notebook, 0% found in a real scan. The notebook now splits rows into one question each,
+  and `evaluate` asks the way `Pipeline.classify` does: the relevance question alone, then each
+  later stage on its own.
+- **`evaluate` decides whether a model is good enough.** It scores any backend on `test.jsonl`
+  (found, precision, maybe, sub-topics; separately for Jev's answers and your labels) and shows
+  the same numbers at other thresholds from the answers it already has, so thresholds are chosen
+  from a table rather than tuned to a handful of test papers.
+- **Training stays out of the repository's runtime.** The Colab notebook trains with Unsloth on a
+  free GPU and uploads a GGUF; the scanner only needs llama.cpp to serve it. Results of the runs
+  so far are in [training-results.md](training-results.md).
+
 ## Consequences
 
 - Getting started is easy: install, add a key, run. There is nothing to host.
@@ -100,6 +153,9 @@ shows it read-only and lets you pick a config file, and each config has its own 
   hours, but it can be interrupted and resumed at any time.
 - Changing a topic's questions does not re-classify old papers. Start a new data folder instead.
 - Keyword search is not available because OAI-PMH has none. Jev is the filter.
+- A local model learns Jev's boundary from Jev's own answers plus a few hand labels. It copies
+  Jev's clear answers well but is overconfident on the borderline papers Jev left at "maybe";
+  labelling those papers matters more than scanning more.
 
 ## Follow-ups
 
